@@ -2,15 +2,34 @@ from __future__ import annotations
 from config import *
 from utils import *
 from feeds.core import ws_status_text, LIVE_WS_STATUS
-from feeds.market_book import status as market_book_status
-from feeds.struct_shadow import status as struct_status
-from trading.priority import status as priority_status
 from trading.ledger import open_capital
 
 def stats(values):
     values=[num(x) for x in values if x is not None]
     if not values:return {"count":0}
     return {"count":len(values),"average":money(sum(values)/len(values)),"minimum":money(min(values)),"maximum":money(max(values))}
+
+
+def _analytics_snapshot(state):
+    rows=[x for x in state.get("trade_observations",[]) if x.get("side")=="BUY"]
+    lat=[num(x.get("latency_ms")) for x in rows if x.get("latency_ms") is not None]
+    gaps=[num(x.get("gap_pct")) for x in rows if x.get("gap_pct") is not None]
+    def bucket(v, edges):
+        for i,e in enumerate(edges):
+            if v < e:return i
+        return len(edges)
+    lat_counts=[0]*5
+    for v in lat:
+        lat_counts[bucket(v,[250,500,1000,2000])]+=1
+    gap_counts=[0]*6
+    for v in gaps:
+        gap_counts[bucket(v,[-10,0,5,10,25])]+=1
+    sources={}; books={}; markets={}
+    for x in rows:
+        sources[x.get("source","unknown")]=sources.get(x.get("source","unknown"),0)+1
+        books[x.get("book","unknown")]=books.get(x.get("book","unknown"),0)+1
+        m=x.get("market","unknown"); markets[m]=markets.get(m,0)+1
+    return {"copies":len(rows),"latency_buckets":{"<250ms":lat_counts[0],"250-500ms":lat_counts[1],"500-1000ms":lat_counts[2],"1-2s":lat_counts[3],">=2s":lat_counts[4]},"gap_buckets":{"<-10%":gap_counts[0],"-10_to_0":gap_counts[1],"0_to_5%":gap_counts[2],"5_to_10%":gap_counts[3],"10_to_25%":gap_counts[4],">=25%":gap_counts[5]},"sources":sources,"books":books,"avg_latency_ms":(sum(lat)/len(lat) if lat else 0),"avg_gap_pct":(sum(gaps)/len(gaps) if gaps else 0)}
 
 def write_reports(state,feed_diag,position_diag,recon):
     open_cap=open_capital(state); closed=state["closed_trades"]
@@ -30,43 +49,54 @@ def write_reports(state,feed_diag,position_diag,recon):
       "live_feed":feed_diag,
       "sell_diagnostics":{"detected":state["sell_detected"],"processed":state["sell_processed"],
         "no_position":state["sell_rejected_no_position"],"liquidity":state["sell_rejected_liquidity"],"pending":len(state.get("pending_sells",{})),"resolution_due":state.get("resolution_due_positions",0),"resolution_redeemable_checked":state.get("resolution_redeemable_checked",0)},
-      "latency":{"count":len(state.get("latency_ms",[])),"avg_ms":stats(state.get("latency_ms",[])).get("average",0),
-        "min_ms":stats(state.get("latency_ms",[])).get("minimum"),"max_ms":stats(state.get("latency_ms",[])).get("maximum"),
-        "processing_avg_ms":state.get("processing_sum_ms",0.0)/max(1,state.get("processing_count",0)),"processing_max_ms":state.get("processing_max_ms",0.0)},
+      "latency":{"count":state["latency_count"],"avg_ms":state["latency_sum_ms"]/max(1,state["latency_count"]),
+        "min_ms":state["latency_min_ms"],"max_ms":state["latency_max_ms"]},
       "reconciliation":recon,
-      "execution":{"latency_ms":stats(state["latency_ms"]),"entry_slippage_pct":stats(state["entry_slippage_pct"]),"exit_slippage_pct":stats(state["exit_slippage_pct"])}}
+      "execution":{"latency_ms":stats(state["latency_ms"]),"entry_slippage_pct":stats(state["entry_slippage_pct"]),"exit_slippage_pct":stats(state["exit_slippage_pct"]),"analytics":_analytics_snapshot(state)}}
     save(FILES["summary"],summary); save(FILES["trader_positions"],list(state["trader_positions"].values()))
     save(FILES["our_positions"],list(state["our_positions"].values())); save(FILES["closed_trades"],state["closed_trades"])
     save(FILES["fills"],state["fills"]); save(FILES["reconciliation"],state["reconciliation"]); save(FILES["state"],state)
 
 def print_status(state,feed_diag,recon,force=False):
-    if not force and now()-num(state.get("last_status"))<STATUS_EVERY:return
-    state["last_status"]=now(); open_cap=open_capital(state); available=max(0,MAX_OPEN_CAPITAL-open_cap); age=feed_diag.get("newest_age_seconds")
-    feed_text=feed_diag.get("status","UNKNOWN") if age is None else f"{feed_diag.get('status','UNKNOWN')} ({age:.1f}s)"
-    lat_values=[num(x) for x in state.get("latency_ms",[]) if x is not None]
-    n=len(lat_values); avg=sum(lat_values)/n if n else 0
-    print("");print("="*68);print(f"[{ist()}] 60-SECOND STATUS");print("="*68)
-    print(f"Feed: {feed_text} | New this cycle: {feed_diag.get('new_this_cycle',0)}")
-    print(f"Live WS: {ws_status_text()}")
-    print(f"WS wallet matches: {LIVE_WS_STATUS['wallet_matches']} | BUY candidates: {LIVE_WS_STATUS['buy_candidates']} | SELL candidates: {LIVE_WS_STATUS['sell_candidates']}")
-    print(f"Copied: BUY {state['copied_buys']} | SELL {state['copied_sells']} | Size {COPY_NOTIONAL_FRACTION*100:.0f}% of trader")
-    print(f"Capital: OPEN ${open_cap:.2f} | FREE ${available:.2f} / ${MAX_OPEN_CAPITAL:.2f}")
-    print(f"P&L: OUR ${state['our_realized_pnl']:+.2f} | TRADER ${state['trader_realized_pnl']:+.2f} | Trader W/L {state.get('trader_settlement_wins',0)}/{state.get('trader_settlement_losses',0)}")
-    if n: print(f"Copy latency: avg {avg:.0f}ms | min {min(lat_values):.0f}ms | max {max(lat_values):.0f}ms")
-    else: print("Copy latency: no copied executions yet")
-    ps=priority_status(); bs=market_book_status(); ss=struct_status()
-    print(f"Priority: queue {ps.get('queue_wait_avg_ms',0):.0f}ms avg | copied {ps.get('copied',0)} | rejected {ps.get('rejected',0)}")
-    print(f"Book: last {bs.get('last_lookup_source','NONE')} | fallbacks {bs.get('fallbacks',0)} | WS assets {bs.get('subscribed_assets',0)}")
-    if ss.get('enabled'):
-        print(f"Struct shadow: {'UP' if ss.get('connected') else 'DOWN'} | confirmed {ss.get('confirmed',0)} | reconnects {ss.get('reconnects',0)}")
-    print(f"Feed rows: trades {feed_diag.get('trades_executions',0)} | activity {feed_diag.get('activity_executions',0)}")
-    print(f"SELL diagnostics: detected {state['sell_detected']} | processed {state['sell_processed']} | no-position {state['sell_rejected_no_position']} | no-bid {state['sell_rejected_liquidity']} | pending {len(state.get('pending_sells',{}))}")
-    print(f"Quality: wide-gap {state['wide_gap_count']} | micro-trades {state['micro_trade_count']} | API errors {state['api_errors']}")
-    print(f"Exits: SELL {state['copied_sells']} | Settled {state['settled_positions']} | Wins {state['settlement_wins']} | Losses {state['settlement_losses']}")
-    print(f"Resolution: due {state.get('resolution_due_positions',0)} | unresolved {state.get('resolution_unresolved_positions',0)} | markets checked {state.get('resolution_markets_checked',0)}")
-    api_age=now()-state["api_last_ok"] if state["api_last_ok"] else None
-    api_err = state.get("api_last_error", "")
-    api_err_text = f" | Last error: {api_err[:100]}" if api_err else ""
-    print(f"API: {'OK '+format(api_age,'.0f')+'s ago' if api_age is not None else 'NO SUCCESS'} | Requests {state['api_requests']} | Errors {state['api_errors']} | Rate limits {state['api_rate_limits']}{api_err_text}")
-    print(f"Reconcile: match {recon.get('matches',0)} | share diff {recon.get('share_mismatches',0)} | missing local {recon.get('missing_local',0)} | missing API {recon.get('missing_api',0)}")
-    print("="*68)
+    if not force and now()-num(state.get("last_status"))<STATUS_EVERY:
+        return
+    state["last_status"]=now()
+    open_cap=open_capital(state)
+    available=max(0,MAX_OPEN_CAPITAL-open_cap)
+    age=feed_diag.get("newest_age_seconds")
+    feed_text=feed_diag.get("status","UNKNOWN") if age is None else f"{feed_diag.get('status','UNKNOWN')} {age:.1f}s"
+    n=state["latency_count"]
+    avg=state["latency_sum_ms"]/n if n else 0
+
+    try:
+        from trading.priority import stats as priority_stats
+        ps=priority_stats()
+    except Exception:
+        ps={"queue_depth":0,"processed":0,"errors":0,"last_copy_ms":0,"last_total_ms":0,"copy_avg_ms":0,"copy_p95_ms":0}
+    try:
+        from feeds.market_book import status as book_status
+        bs=book_status()
+    except Exception:
+        bs={"connected":False,"subscribed":0,"snapshots":0,"price_changes":0,"fallbacks":0,"reconnects":0,"stale_reconnects":0}
+
+    trader_w=state.get("trader_settlement_wins",0)
+    trader_l=state.get("trader_settlement_losses",0)
+    trader_total=trader_w+trader_l
+    trader_wr=(trader_w/trader_total*100) if trader_total else 0
+
+    print("")
+    print(f"[{ist()}] STATUS | TRADER WS {ws_status_text()} | CLOB WS {'LIVE' if bs.get('connected') else 'OFF'}")
+    print(f"COPY  {state['copied_buys']}B/{state['copied_sells']}S | {COPY_NOTIONAL_FRACTION*100:.0f}% size | queue {ps.get('queue_depth',0)}")
+    print(f"BOOK  {bs.get('subscribed',0)} assets | snapshots {bs.get('snapshots',0)} | changes {bs.get('price_changes',0)} | REST fallbacks {bs.get('fallbacks',0)}")
+    print(f"LAT   copy avg {ps.get('copy_avg_ms',0):.0f}ms | p95 {ps.get('copy_p95_ms',0):.0f}ms | last {ps.get('last_total_ms',0):.0f}ms | queue {ps.get('last_queue_ms',0):.0f}ms")
+    a=_analytics_snapshot(state)
+    print(f"ANALYTICS copies {a['copies']} | lat <250/{a['latency_buckets']['<250ms']} 250-500/{a['latency_buckets']['250-500ms']} 500-1s/{a['latency_buckets']['500-1000ms']} 1-2s/{a['latency_buckets']['1-2s']} >2s/{a['latency_buckets']['>=2s']}")
+    print(f"ANALYTICS gap <-10/{a['gap_buckets']['<-10%']} -10..0/{a['gap_buckets']['-10_to_0']} 0..5/{a['gap_buckets']['0_to_5%']} 5..10/{a['gap_buckets']['5_to_10%']} 10..25/{a['gap_buckets']['10_to_25%']} >=25/{a['gap_buckets']['>=25%']} | avg gap {a['avg_gap_pct']:+.2f}%")
+    print(f"ANALYTICS source {a['sources']} | book {a['books']}")
+    print(f"CAP   open ${open_cap:.2f} | free ${available:.2f}/${MAX_OPEN_CAPITAL:.2f}")
+    print(f"P&L   ours ${state['our_realized_pnl']:+.2f} | trader ${state['trader_realized_pnl']:+.2f} | trader W/L {trader_w}/{trader_l} ({trader_wr:.0f}%)")
+    print(f"EXIT  settled {state['settled_positions']} | W/L {state['settlement_wins']}/{state['settlement_losses']} | open {sum(1 for p in state['our_positions'].values() if p.get('status')=='OPEN' and num(p.get('shares'))>1e-9)}")
+    print(f"API   {state['api_requests']} req | {state['api_errors']} err | reconcile {recon.get('matches',0)} match/{recon.get('share_mismatches',0)} diff")
+    if ps.get('errors') or state.get('api_errors') or bs.get('stale_reconnects'):
+        print(f"WARN  copy {ps.get('errors',0)} errors | API {state.get('api_errors',0)} | CLOB stale reconnects {bs.get('stale_reconnects',0)}")
+    print("-"*72)
