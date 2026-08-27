@@ -1,11 +1,44 @@
 from __future__ import annotations
-import threading
 
 from config import *
 from utils import *
 from api import *
 from trading.pricing import buy_vwap, sell_vwap
-from feeds.market_book import fetch_book, status as market_book_status
+
+
+def execution_book(asset):
+    """Use the in-memory CLOB WebSocket book first; REST is fallback only."""
+    try:
+        from feeds.market_book import ensure_asset, get_book, status as book_status
+        ensure_asset(asset)
+        book = get_book(asset)
+        if book:
+            return book
+        try:
+            from feeds.market_book import note_fallback
+            note_fallback()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return fetch_book(asset)
+
+
+def execution_book_with_source(asset):
+    """Return (book, source) without changing the legacy execution_book API."""
+    try:
+        from feeds.market_book import ensure_asset, get_book, note_fallback
+        ensure_asset(asset)
+        book = get_book(asset)
+        if book:
+            return book, "WS"
+        try:
+            note_fallback()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return fetch_book(asset), "REST_FALLBACK"
 
 
 def new_state():
@@ -15,7 +48,7 @@ def new_state():
         "our_realized_pnl":0.0,"trader_realized_pnl":0.0,"copied_buys":0,"copied_sells":0,
         "duplicates_ignored":0,"duplicate_candidates":0,"skipped_capital":0,"api_errors":0,
         "api_consecutive_failures":0,"api_last_ok":0.0,"api_last_error":"","api_rate_limits":0,
-        "api_requests":0,"api_error_details":[],"last_reconcile":0.0,"last_status":0.0,"latency_count":0,"latency_sum_ms":0.0,
+        "api_requests":0,"last_reconcile":0.0,"last_status":0.0,"latency_count":0,"latency_sum_ms":0.0,
         "latency_max_ms":0.0,"latency_min_ms":None,"wide_gap_count":0,"micro_trade_count":0,
         "last_closed_check":0.0,"last_resolution_check":0.0,"settled_positions":0,"settlement_wins":0,
         "settlement_losses":0,"trader_settled_positions":0,"trader_settlement_wins":0,"trader_settlement_losses":0,"exit_events":0,"skipped_liquidity":0,"latency_ms":[],
@@ -25,9 +58,7 @@ def new_state():
         "sell_rejected_duplicate":0,"sell_processed":0,"buy_detected":0,
         "pending_sells":{},
         "trader_ledger_seen":[],"last_sell_recovery_fetch":0.0,
-        "priority_events":0,"priority_queue_wait_ms":0.0,"priority_copy_ms":0.0,"priority_copy_max_ms":0.0,"priority_last_copy_ms":0.0,
-        "processing_count":0,"processing_sum_ms":0.0,"processing_max_ms":0.0,
-        "resolution_wait_log":{},
+        "trade_observations":[],
     }
 
 
@@ -53,7 +84,8 @@ def create_position(key,t,owner):
             "slug":market_slug(t),"duration":duration,"duration_seconds":seconds,"market_end_ts":market_end(t),
             "shares":0.0,"total_cost":0.0,"average_entry":0.0,"realized_pnl":0.0,
             "first_buy_timestamp":None,"last_activity_timestamp":None,"closed_timestamp":None,
-            "buy_count":0,"sell_count":0,"status":"OPEN","exit_reason":None}
+            "buy_count":0,"sell_count":0,"status":"OPEN","exit_reason":None,
+            "copy_latencies_ms":[],"copy_gaps_pct":[],"copy_sources":{},"copy_books":{}}
 
 
 def add_buy(p,shares,price,ts):
@@ -90,62 +122,6 @@ def _position_matches(pos,t):
     return bool(asset or cond)
 
 
-
-# One global claim lock is shared by FAST WebSocket and REST recovery paths.
-# Their worker locks are intentionally different, so deduplication must happen
-# here at the single ledger boundary.
-_COPY_CLAIM_LOCK = threading.RLock()
-_COPY_CLAIM_TTL_SECONDS = 3600.0
-_COPY_CLAIM_MAX = 50000
-
-
-def _trade_claim_keys(t):
-    """Return stable identity aliases without merging distinct fills.
-
-    Prefer transaction/execution IDs. Only use the economic fingerprint when
-    the feed provides no usable ID at all; otherwise two legitimate fills with
-    identical economics could be incorrectly collapsed.
-    """
-    ids = []
-    for k in ("transactionHash", "transaction_hash", "txHash", "hash",
-              "tradeId", "trade_id", "id"):
-        v = t.get(k) if isinstance(t, dict) else None
-        if v not in (None, "", "0"):
-            ids.append("ID|" + str(v).lower())
-    if ids:
-        return list(dict.fromkeys(ids))
-    try:
-        return ["ECON|" + economic_trade_fingerprint(t)]
-    except Exception:
-        return []
-
-
-def claim_copy_once(state, t):
-    """Atomically claim a trade so FAST/RECOVERY can never both copy it."""
-    keys = _trade_claim_keys(t)
-    if not keys:
-        return True
-    now_ts = now()
-    with _COPY_CLAIM_LOCK:
-        claims = state.setdefault("copy_claims", {})
-        if not isinstance(claims, dict):
-            claims = {}
-            state["copy_claims"] = claims
-        cutoff = now_ts - _COPY_CLAIM_TTL_SECONDS
-        for k, ts in list(claims.items()):
-            if num(ts) < cutoff:
-                claims.pop(k, None)
-        if any(k in claims for k in keys):
-            return False
-        for k in keys:
-            claims[k] = now_ts
-        if len(claims) > _COPY_CLAIM_MAX:
-            oldest = sorted(claims.items(), key=lambda x: num(x[1]))[:len(claims)-_COPY_CLAIM_MAX]
-            for k, _ in oldest:
-                claims.pop(k, None)
-        return True
-
-
 def _find_position(state,t,owner):
     positions=state.get(owner,{})
     key=trade_key(t)
@@ -177,26 +153,28 @@ def update_trader_ledger(state,t):
 
 
 def copy_buy(state,t,observed,source="unknown"):
-    trader_notional = trade_size(t) * trade_price(t)
-    notional = trader_notional * COPY_NOTIONAL_FRACTION
-    available=MAX_OPEN_CAPITAL-open_capital(state)
+    notional=trade_size(t)*trade_price(t)*COPY_NOTIONAL_FRACTION; available=MAX_OPEN_CAPITAL-open_capital(state)
     if notional<=0:return False
     if notional>available+1e-9:
         state["skipped_capital"]+=1; print(f"  ⚠️ SKIP BUY | ${notional:.2f} exceeds available ${max(0,available):.2f}"); return False
-    book=fetch_book(trade_asset(t)); our_price,our_shares=buy_vwap(book,notional)
+    book,book_source=execution_book_with_source(trade_asset(t)); our_price,our_shares=buy_vwap(book,notional)
     if our_price is None:
-        state["skipped_liquidity"]+=1; print(f"  ⚠️ SKIP BUY | no sufficient ask liquidity for ${notional:.2f}"); return False
+        state["skipped_liquidity"]+=1; print(f"SKIP BUY | no ask liquidity | ${notional:.2f}"); return False
     key=trade_key(t); p=state["our_positions"].get(key)
     if not p:p=create_position(key,t,"OUR");state["our_positions"][key]=p
     add_buy(p,our_shares,our_price,trade_ts(t))
-    latency=max(0,(observed-trade_ts(t))*1000); gap=((our_price-trade_price(t))/trade_price(t)*100) if trade_price(t) else 0
+    detected_at=num(t.get("_detected_at"), trade_ts(t))
+    latency=max(0,(now()-detected_at)*1000) if t.get("_detected_at") else max(0,(observed-trade_ts(t))*1000)
+    gap=((our_price-trade_price(t))/trade_price(t)*100) if trade_price(t) else 0
+    p.setdefault("copy_latencies_ms",[]).append(latency)
+    p.setdefault("copy_gaps_pct",[]).append(gap)
+    p.setdefault("copy_sources",{})[source]=p.setdefault("copy_sources",{}).get(source,0)+1
+    p.setdefault("copy_books",{})[book_source]=p.setdefault("copy_books",{}).get(book_source,0)+1
     state["copied_buys"]+=1;state["latency_ms"].append(latency);state["entry_slippage_pct"].append(gap)
-    state["fills"].append({"time_ist":ist(observed),"type":"OUR_BUY","trade_id":trade_id(t),"market":market_name(t),"asset":trade_asset(t),"outcome":trade_outcome(t),"trader_price":money(trade_price(t)),"trader_shares":money(trade_size(t)),"trader_notional":money(trader_notional),"copy_notional":money(notional),"our_price":money(our_price),"our_shares":money(our_shares),"our_notional":money(our_shares*our_price),"price_gap_pct":money(gap),"latency_ms":money(latency)})
-    bstat = market_book_status()
-    print("  ✅ COPIED BUY")
-    print(f"     Trader: ${trader_notional:.4f} @ ${trade_price(t):.4f} | Copy: ${notional:.4f} ({COPY_NOTIONAL_FRACTION:.0%})")
-    print(f"     Us:     ${our_shares*our_price:.4f} @ ${our_price:.4f}")
-    print(f"     Gap:    {gap:+.2f}% | Latency: {latency:.0f} ms | Book: {bstat.get('last_lookup_source','?')}")
+    observation={"time_ist":ist(observed),"side":"BUY","trade_id":trade_id(t),"market":market_name(t),"asset":trade_asset(t),"outcome":trade_outcome(t),"source":source,"book":book_source,"trader_price":money(trade_price(t)),"trader_shares":money(trade_size(t)),"trader_notional":money(trade_size(t)*trade_price(t)),"copy_notional":money(notional),"our_price":money(our_price),"our_shares":money(our_shares),"our_notional":money(our_shares*our_price),"gap_pct":money(gap),"latency_ms":money(latency),"position_key":key}
+    state.setdefault("trade_observations",[]).append(observation)
+    state["fills"].append({"time_ist":ist(observed),"type":"OUR_BUY","trade_id":trade_id(t),"market":market_name(t),"asset":trade_asset(t),"outcome":trade_outcome(t),"trader_price":money(trade_price(t)),"trader_shares":money(trade_size(t)),"trader_notional":money(notional),"our_price":money(our_price),"our_shares":money(our_shares),"our_notional":money(our_shares*our_price),"price_gap_pct":money(gap),"latency_ms":money(latency)})
+    print(f"COPY|side=BUY|source={source}|book={book_source}|id={trade_id(t)}|market={market_name(t)[:48]}|trader=${trade_price(t):.4f}|us=${our_price:.4f}|copy=${notional:.4f}|shares={our_shares:.6f}|gap={gap:+.2f}%|lat={latency:.0f}ms")
     return True
 
 
@@ -205,8 +183,7 @@ def copy_sell(state,t,observed,source="unknown"):
     key,p=_find_position(state,t,"our_positions")
     if not p:
         state["sell_rejected_no_position"]+=1
-        print("  ❌ SELL REJECTED | local position not found")
-        print(f"     Asset: {trade_asset(t)} | Condition: {trade_condition(t)} | Outcome: {trade_outcome(t)}")
+        print(f"SKIP SELL | no local position | {market_name(t)[:42]}")
         return False
 
     # A pending SELL may be retried after the trader ledger has already been
@@ -224,23 +201,23 @@ def copy_sell(state,t,observed,source="unknown"):
         else: fraction=min(1.0,sell_size/max(num(p.get("shares")),1e-12))
     shares=min(num(p.get("shares")),num(p.get("shares"))*fraction)
     if shares<=1e-9:
-        state["sell_rejected_no_position"]+=1; print("  ❌ SELL REJECTED | zero local shares"); return False
+        state["sell_rejected_no_position"]+=1; print("SKIP SELL | zero local shares"); return False
 
-    book=fetch_book(trade_asset(t)); our_price,proceeds=sell_vwap(book,shares)
+    book,book_source=execution_book_with_source(trade_asset(t)); our_price,proceeds=sell_vwap(book,shares)
     if our_price is None:
         state["sell_rejected_liquidity"]+=1;state["skipped_liquidity"]+=1
-        print(f"  ⚠️ SKIP SELL | insufficient bid liquidity for {shares:.6f} shares")
+        print(f"SKIP SELL | no bid liquidity | {shares:.4f}sh")
         return False
 
     pnl=sell_position(p,shares,our_price,trade_ts(t),"TRADER_SELL")
     state["our_realized_pnl"]+=pnl;state["copied_sells"]+=1;state["sell_processed"]+=1
-    latency=max(0,(observed-trade_ts(t))*1000);gap=((trade_price(t)-our_price)/trade_price(t)*100) if trade_price(t) else 0
+    detected_at=num(t.get("_detected_at"), trade_ts(t))
+    latency=max(0,(now()-detected_at)*1000) if t.get("_detected_at") else max(0,(observed-trade_ts(t))*1000)
+    gap=((trade_price(t)-our_price)/trade_price(t)*100) if trade_price(t) else 0
     state["latency_ms"].append(latency);state["exit_slippage_pct"].append(gap)
+    state.setdefault("trade_observations",[]).append({"time_ist":ist(observed),"side":"SELL","trade_id":trade_id(t),"market":market_name(t),"asset":trade_asset(t),"outcome":trade_outcome(t),"source":source,"book":book_source,"trader_price":money(trade_price(t)),"trader_shares":money(trade_size(t)),"our_price":money(our_price),"our_shares":money(shares),"gap_pct":money(gap),"latency_ms":money(latency),"pnl":money(pnl),"position_key":key})
     state["fills"].append({"time_ist":ist(observed),"type":"OUR_SELL","trade_id":trade_id(t),"market":market_name(t),"asset":trade_asset(t),"outcome":trade_outcome(t),"trader_price":money(trade_price(t)),"trader_shares":money(trade_size(t)),"our_price":money(our_price),"our_shares":money(shares),"our_proceeds":money(proceeds),"our_pnl":money(pnl),"price_gap_pct":money(gap),"latency_ms":money(latency)})
-    bstat = market_book_status()
-    print("  ↘️ COPIED SELL")
-    print(f"     Trader: ${trade_price(t):.4f} | Us: ${our_price:.4f}")
-    print(f"     Shares: {shares:.6f} | P&L: ${pnl:+.4f} | Book: {bstat.get('last_lookup_source','?')}")
+    print(f"COPY|side=SELL|source={source}|book={book_source}|id={trade_id(t)}|market={market_name(t)[:48]}|trader=${trade_price(t):.4f}|us=${our_price:.4f}|shares={shares:.6f}|gap={gap:+.2f}%|lat={latency:.0f}ms|pnl=${pnl:+.4f}")
     return True
 
 
@@ -285,10 +262,6 @@ def retry_pending_sells(state, observed=None, max_age_seconds=900):
 
 
 def process_trade(state,t,observed,source="unknown"):
-    # Final atomic dedup boundary shared by FAST WS and REST recovery.
-    if not claim_copy_once(state, t):
-        state["copy_duplicates_skipped"] = state.get("copy_duplicates_skipped", 0) + 1
-        return False
     side=trade_side(t)
     if side=="BUY":
         state["buy_detected"]+=1
