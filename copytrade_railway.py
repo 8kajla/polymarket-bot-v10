@@ -105,6 +105,7 @@ from trading.priority import (
     submit_priority_trade,
     stats as priority_stats,
     state_lock,
+    set_ready as set_copy_ready,
 )
 
 from api import (
@@ -271,6 +272,7 @@ def main():
     # ========================================================
 
     start_copy_worker(state)
+    set_copy_ready()
 
     print("  ✓ Priority copy worker started")
 
