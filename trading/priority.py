@@ -37,6 +37,30 @@ STATUS = {
 }
 
 
+
+def state_lock():
+    """Return the shared priority/state lock for callers that need coordination."""
+    return STATE_LOCK
+
+
+def submit_priority_trade(trade, observed=None, source="rest"):
+    """Enqueue a recovery execution onto the same queue used by live WS events."""
+    if not isinstance(trade, dict):
+        return False
+    if not WS_PRIORITY_COPY:
+        return False
+
+    row = dict(trade)
+    row["_feed_source"] = str(source or "rest")
+    row.setdefault("_ws_received_at", float(observed if observed is not None else now()))
+
+    try:
+        LIVE_WS_QUEUE.put_nowait(row)
+        return True
+    except Exception:
+        return False
+
+
 def _process_one(state, trade):
     received = float(trade.get("_ws_received_at") or now())
     observed = now()
@@ -130,3 +154,8 @@ def status():
     processed = max(1, int(out["processed"]))
     out["queue_wait_avg_ms"] = out["queue_wait_ms_sum"] / processed
     return out
+
+
+# Backward-compatible alias used by copytrade_railway.py.
+def stats():
+    return status()
