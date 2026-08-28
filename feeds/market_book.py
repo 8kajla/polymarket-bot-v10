@@ -367,6 +367,30 @@ def get_local_book(asset):
         return _snapshot_public(book), "WS", age
 
 
+def ensure_asset(asset):
+    """Ensure an asset is subscribed to the live CLOB book stream.
+
+    This compatibility helper is used by the execution engine so the hot path
+    can request a subscription without touching REST.
+    """
+    asset = str(asset or "").strip()
+    if asset:
+        subscribe_assets([asset])
+    return asset
+
+
+def get_book(asset):
+    """Return a fresh local WS book, or None when unavailable/stale."""
+    book, source, _age = get_local_book(asset)
+    return book if source == "WS" else None
+
+
+def note_fallback():
+    """Record that an execution lookup had to fall back to REST."""
+    with BOOK_LOCK:
+        BOOK_STATUS["fallbacks"] += 1
+
+
 def fetch_book(asset):
     """WS-first local-book lookup; briefly wait for a fresh WS snapshot before REST."""
     subscribe_assets([asset])
